@@ -1,0 +1,13 @@
+# Versions utilisées pour entraîner et sérialiser le modèle.
+# ⚠️ L'API /predict (Partie 3) doit réutiliser les MÊMES versions de
+# scikit-learn / numpy / joblib pour recharger model.joblib sans avertissement.
+scikit-learn==1.8.0
+numpy==2.4.4
+pandas==2.3.3
+joblib==1.5.3
+mlflow==3.14.0
+matplotlib==3.10.8
+
+# Driver PostgreSQL pour le backend MLflow distant (Neon). Inutile en repli local.
+psycopg2-binary==2.9.10
+boto3==1.43.36  # SDK AWS : upload des artefacts MLflow vers S3. Inutile en repli local.
