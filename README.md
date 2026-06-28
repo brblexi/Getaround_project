@@ -1,59 +1,95 @@
-# GetAround — Bloc 5 (Jedha CDSD)
+# GetAround — Projet bloc 5 (Jedha CDSD)
 
-End-to-end project for the GetAround case study: analysing the impact of late
-car returns and serving a rental-price prediction model.
+Projet de fin de bloc 5 (industrialisation et déploiement d'un modèle de ML).
+À partir des données GetAround, deux volets :
 
-> **Status** — All three deliverables are complete: delay-analysis dashboard,
-> pricing model with MLflow tracking, and the documented `/predict` API.
+- l'analyse de l'impact des retours tardifs sur la location suivante, restituée
+  dans un dashboard interactif ;
+- un modèle de prédiction du prix de location journalier, exposé via une API.
 
-## Deliverables
+## Liens
 
-| # | Deliverable | Stack | Status |
-|---|-------------|-------|--------|
-| 0 | **Exploration des données** (EDA) | Jupyter + pandas + seaborn | ✅ done |
-| 1 | Delay-analysis **dashboard** | Streamlit + Plotly, Docker → HF Spaces | ✅ done |
-| 2 | **Pricing model** + experiment tracking | scikit-learn + MLflow | ✅ done |
-| 3 | **`/predict` API** (documented) | FastAPI + Docker → HF Spaces | ✅ done |
+- Dépôt GitHub : https://github.com/brblexi/getaround_project
+- Dashboard (analyse des délais) : https://huggingface.co/spaces/AlexBarbier/getaround-dashboard
+- API de prédiction de prix : https://huggingface.co/spaces/AlexBarbier/getaround-api
 
-## Repository layout
+## Organisation du dépôt
 
 ```
 getaround/
-├── notebooks/            # Exploratory data analysis (EDA)
-│   ├── 01_exploration_donnees.ipynb
-│   └── requirements.txt
-├── model/                # Part 2 — Pricing model + MLflow
-│   ├── 02_modelisation_pricing.ipynb
-│   ├── train.py
-│   ├── data/  ·  artifacts/model.joblib  ·  requirements.txt
-│   └── README.md
-├── api/                  # Part 3 — FastAPI /predict endpoint
-│   ├── app.py  ·  model.joblib  ·  Dockerfile  ·  requirements.txt
-│   └── README.md
-├── dashboard/            # Part 1 — Streamlit delay-analysis dashboard
-│   ├── app.py            #   UI
-│   ├── utils.py          #   data loading + analysis/simulation logic
-│   ├── data/             #   source datasets
-│   ├── Dockerfile        #   HF Spaces (Docker SDK), port 7860
-│   ├── requirements.txt
-│   ├── .streamlit/config.toml
-│   └── README.md         #   Space README (YAML frontmatter)
-├── .gitignore
-└── README.md             # this file
+├── notebooks/      EDA — exploration des deux jeux de données
+├── dashboard/      Partie 1 — dashboard Streamlit (analyse des délais)
+├── model/          Partie 2 — entraînement du modèle + suivi MLflow
+└── api/            Partie 3 — API FastAPI (endpoint /predict)
 ```
 
-## Part 1 — Delay analysis
+Chaque dossier déployable (`dashboard/`, `api/`) a son propre `requirements.txt`
+et son `Dockerfile`.
 
-Quantifies how often cars are returned late, how that impacts the *next*
-driver (cancellations rise from ~11% to ~17% when impacted), and provides an
-interactive simulator for the **minimum-delay-between-rentals** threshold and
-scope (all cars vs Connect-only), showing the trade-off between problems
-solved and rentals blocked.
+## Partie 1 — Analyse des délais
 
-See [`dashboard/README.md`](dashboard/README.md) to run or deploy.
+Le dashboard quantifie la fréquence des retours en retard et leur impact sur la
+location suivante (le taux d'annulation passe d'environ 11 % à 17 % quand la
+location est impactée par un retard précédent), puis propose un simulateur du
+seuil de délai minimum entre deux locations et de son périmètre (toutes les
+voitures ou Connect uniquement), pour arbitrer entre problèmes résolus et
+locations bloquées.
 
-## Links
+Pour lancer en local :
 
-- **Dashboard (HF Space):** _add URL after deployment_
-- **API (HF Space):** _add URL after deployment_
-- **GitHub repo:** _add URL_
+```
+cd dashboard
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+## Partie 2 — Modèle de pricing
+
+Nettoyage des données, pipeline scikit-learn (encodage + standardisation),
+comparaison d'une régression linéaire et d'un RandomForest, suivi des
+expériences avec MLflow. Le meilleur modèle (RandomForest, RMSE ≈ 17 €,
+R² ≈ 0,75) est sérialisé dans `model/artifacts/model.joblib` et réutilisé par
+l'API.
+
+```
+cd model
+pip install -r requirements.txt
+python train.py        # entraînement + log MLflow
+mlflow ui              # http://localhost:5000
+```
+
+## Partie 3 — API de prédiction
+
+API FastAPI qui charge le modèle et expose l'endpoint `POST /predict`. La
+documentation interactive est disponible sur `/docs`.
+
+Exemple avec curl :
+
+```
+curl -X POST "https://AlexBarbier-getaround-api.hf.space/predict" \
+  -H "Content-Type: application/json" \
+  -d '{"model_key":"Citroën","mileage":140000,"engine_power":100,"fuel":"diesel","paint_color":"black","car_type":"sedan","private_parking_available":true,"has_gps":true,"has_air_conditioning":false,"automatic_car":false,"has_getaround_connect":true,"has_speed_regulator":true,"winter_tires":false}'
+```
+
+Réponse :
+
+```
+{"rental_price_per_day": 115.6}
+```
+
+Exemple en Python :
+
+```python
+import requests
+
+car = {
+    "model_key": "Citroën", "mileage": 140000, "engine_power": 100,
+    "fuel": "diesel", "paint_color": "black", "car_type": "sedan",
+    "private_parking_available": True, "has_gps": True,
+    "has_air_conditioning": False, "automatic_car": False,
+    "has_getaround_connect": True, "has_speed_regulator": True,
+    "winter_tires": False,
+}
+r = requests.post("https://AlexBarbier-getaround-api.hf.space/predict", json=car)
+print(r.json())
+```
