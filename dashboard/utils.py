@@ -6,12 +6,12 @@
 POURQUOI CE FICHIER EXISTE
 --------------------------
 On sépare volontairement la LOGIQUE MÉTIER (ce fichier) de l'INTERFACE
-(app.py). Avantages, et arguments à donner au jury :
+(app.py). Avantages, et arguments :
   - testable : on peut valider les calculs sans lancer l'interface ;
   - réutilisable : on peut rejouer ces fonctions dans un notebook ;
   - lisible : l'app ne contient que de l'affichage, pas de calcul.
 
-VOCABULAIRE CLÉ (à connaître pour la restitution)
+VOCABULAIRE CLÉ
 -------------------------------------------------
   - paire "enchaînée" : une location qui suit une autre location de la
     MÊME voiture, dans un intervalle de moins de 12h.

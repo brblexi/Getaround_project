@@ -10,8 +10,10 @@ Projet de fin de bloc 5 (industrialisation et déploiement d'un modèle de ML).
 ## Liens
 
 - Dépôt GitHub : https://github.com/brblexi/getaround_project
-- Dashboard (analyse des délais) : https://huggingface.co/spaces/AlexBarbier/getaround-dashboard
-- API de prédiction de prix : https://huggingface.co/spaces/AlexBarbier/getaround-api
+- Dashboard : https://huggingface.co/spaces/AlexBarbier/getaround-dashboard
+  (application : https://alexbarbier-getaround-dashboard.hf.space)
+- API : https://huggingface.co/spaces/AlexBarbier/getaround-api
+  (documentation interactive : https://alexbarbier-getaround-api.hf.space/docs)
 
 ## Organisation du dépôt
 

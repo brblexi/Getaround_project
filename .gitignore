@@ -5,3 +5,11 @@ __pycache__/
 mlruns/
 .env
 model/artifacts/
+
+# Supports de soutenance et notes personnelles
+*.pptx
+NOTE-PASSATION-*.md
+
+# Supports de soutenance et notes personnelles
+*.pptx
+NOTE-PASSATION-*.md
