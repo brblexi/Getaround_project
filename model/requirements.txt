@@ -9,6 +9,7 @@ mlflow==3.14.0
 matplotlib==3.10.8
 
 psycopg2-binary==2.9.10  # Driver PostgreSQL pour le backend MLflow distant (Neon)  (inutile en repli local)
+sqlalchemy==2.0.44       # notebook 03 queries the MLflow backend directly
 boto3==1.43.36  # SDK AWS : upload des artefacts MLflow vers S3. (inutile en repli local)
 
 python-dotenv==1.2.1  # lecture du .env en local ; sans effet en production (pas de .env dans le conteneur)

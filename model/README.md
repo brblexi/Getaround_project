@@ -1,131 +1,158 @@
-# Partie 2 — Modèle de prédiction du prix de location
+# Part 2 — Rental price prediction model
 
-Prédit `rental_price_per_day` à partir des caractéristiques d'une voiture.
-Régression supervisée, suivi des expériences avec **MLflow**.
+Predicts `rental_price_per_day` from a car's characteristics. Supervised
+regression, with experiment tracking in **MLflow**.
 
-## Contenu
+## Contents
 
 ```
 model/
-├── 02_modelisation_pricing.ipynb   # notebook narratif (démarche complète)
-├── train.py                        # version exécutable en une commande
-├── data/                           # jeu de données pricing
-├── artifacts/model.joblib          # pipeline entraîné (réutilisé par l'API)
-├── .env.example                    # variables de configuration à recopier en .env
+├── 02_price_modelling.ipynb          # narrative notebook (the full reasoning)
+├── 03_tracking_infrastructure.ipynb  # reads the tracking backend in SQL
+├── train.py                          # the same run, in one command
+├── test_train.py                     # 8 tests on cleaning, pipeline, metrics
+├── data/                             # pricing dataset
+├── artifacts/model.joblib            # trained pipeline (consumed by the API)
+├── artifacts/model.json              # what that artifact is (see below)
+├── .env.example                      # configuration to copy to .env
 └── requirements.txt
 ```
 
-## Démarche
+Both notebooks live here rather than in `notebooks/` because their relative paths
+point at this folder: `02` reads `data/` and writes `artifacts/`, `03` loads the
+`.env` sitting next to it. Run them from `model/`.
 
-Nettoyage (3 lignes aberrantes retirées) → pipeline scikit-learn
-(`StandardScaler` + `OneHotEncoder` + booléens) → entraînement de
-`LinearRegression` (baseline) vs `RandomForestRegressor` → suivi MLflow →
-sérialisation du meilleur modèle.
+## Approach
 
-**Résultats (jeu de test) :** le RandomForest l'emporte avec RMSE ≈ 17 €,
-MAE ≈ 11 €, R² ≈ 0,75 (baseline linéaire : RMSE ≈ 18 €, R² ≈ 0,70).
+Cleaning (3 implausible rows removed) → scikit-learn pipeline (`StandardScaler` +
+`OneHotEncoder` + passthrough booleans) → `LinearRegression` (baseline) against
+`RandomForestRegressor` → MLflow tracking → serialisation of the best model.
 
-## Installer les dépendances
+**Test-set results:** the random forest wins with RMSE ≈ 17 €, MAE ≈ 11 €,
+R² ≈ 0.75 (linear baseline: RMSE ≈ 18.4 €, R² ≈ 0.70). Both are well ahead of the
+predict-the-median reference, which `train.py` reports on every run.
 
-Une seule fois, dans le venv du projet :
+## Installing the dependencies
+
+Once, in the project's virtual environment:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Lancer l'entraînement
+## Running the training
 
-`python train.py` suffit : chaque option a une valeur par défaut. Les lignes
-suivantes sont des **variantes**, pas une séquence — on en lance une seule, et
-les options se combinent.
+`python train.py` is enough — every option has a default. The lines below are
+**variants**, not a sequence: run one, and the options combine.
 
 ```bash
-python train.py                                     # 2 modèles, réglages par défaut
-python train.py --model rf                          # un seul modèle (linear | rf | both)
-python train.py --n-estimators 300 --max-depth 20   # autres hyperparamètres de la forêt
-python train.py --experiment autre-nom              # autre expérience MLflow
-python train.py --test-size 0.3                     # autre proportion train/test
+python train.py                                       # both models, defaults
+python train.py --model rf                            # one model (linear | rf | both)
+python train.py --n-estimators 300 --max-depth 20     # other forest hyperparameters
+python train.py --experiment getaround-pricing-sweep  # a fresh MLflow experiment
 ```
 
-Passer par des options plutôt que par l'édition du code rend chaque entraînement
-reproductible : MLflow enregistre les paramètres effectifs du run.
+The last one is how the depth sweep behind `max_depth=12` was produced, and it is
+also the only way to send an existing project's runs to S3 — see the
+`artifact_location` warning below.
 
+`python train.py --help` lists the remaining options (`--test-size`, `--cv`,
+`--output`, `--max-depth -1` for unlimited depth). That listing is generated from
+the code, so unlike this README it cannot fall out of date.
 
-## Suivi des expériences : où atterrissent les données
+Passing options rather than editing the code keeps every run reproducible: MLflow
+records the parameters that were actually used, alongside the git commit and the
+scikit-learn version.
 
-Le suivi **bascule automatiquement** selon les variables d'environnement
-(`get_tracking_uri()` + `setup_experiment()`), avec une séparation
-**backend store / artifact store** :
+### What a run produces
 
-| Donnée | Va dans | Variable |
+Beyond the MLflow run, two files land in `artifacts/`:
+
+- **`model.joblib`** — the complete pipeline, compressed (~2.3 MB). This is the
+  file the API serves; copy it to `api/` and rebuild the image to deploy it.
+- **`model.json`** — a sidecar describing that artifact: model type, test metrics,
+  timestamp, scikit-learn version, git commit, row count, seed. A bare `.joblib`
+  says nothing about itself, and the scikit-learn version is what decides whether
+  it will reload at all.
+
+Cross-validation runs by default (`--cv 5`) and logs `cv_rmse_mean` and
+`cv_rmse_std` alongside the holdout metrics — a single split with a fixed seed
+gives one number with no sense of its variance.
+
+## Experiment tracking: where the data lands
+
+Tracking **switches automatically** on environment variables
+(`get_tracking_uri()` + `setup_experiment()`), with a **backend store / artifact
+store** split:
+
+| Data | Goes to | Variable |
 |---|---|---|
-| Métriques, paramètres, métadonnées des runs | **PostgreSQL / Neon** | `MLFLOW_TRACKING_URI` |
-| Modèle sérialisé, fichiers loggés | **S3** | `MLFLOW_ARTIFACT_LOCATION` (+ clés AWS) |
+| Metrics, parameters, run metadata | **PostgreSQL / Neon** | `MLFLOW_TRACKING_URI` |
+| Serialised model, logged files | **S3** | `MLFLOW_ARTIFACT_LOCATION` (+ AWS keys) |
 
-`train.py` charge le fichier `.env` au démarrage (`load_dotenv`) : il n'y a donc
-**rien à exporter à la main** avant de lancer un entraînement. Si le `.env` est
-absent — ou si les variables n'y sont pas renseignées — le script retombe
-automatiquement sur un stockage **local** (`mlruns/`).
+`train.py` loads `.env` at startup (`load_dotenv`), so **nothing has to be exported
+by hand** before a run. If the `.env` is missing — or the variables are not filled
+in — the script falls back to **local** storage (`mlruns/`).
 
-> 🏭 **Pourquoi `load_dotenv` et pas une lecture de fichier de configuration ?**
-> Le code ne lit que `os.environ`, jamais le `.env` directement. C'est le
-> contrat de production : sur une plateforme (Docker, Space Hugging Face, ECS),
-> les variables sont **injectées par l'hébergeur** et aucun `.env` n'existe —
-> l'appel ne trouve rien et ne fait rien. Le `.env` n'est qu'une commodité de
-> développement local, avec `override=False` pour qu'une variable déjà définie
-> dans l'environnement ait toujours le dernier mot.
+> **Why `load_dotenv` rather than reading a config file?** The code only ever
+> reads `os.environ`, never the `.env` directly. That is the production contract:
+> on a platform (Docker, a Hugging Face Space, ECS) the variables are **injected by
+> the host** and no `.env` exists — the call finds nothing and does nothing. The
+> `.env` is a local development convenience, with `override=False` so a variable
+> already set in the environment always wins.
 
-### Prérequis d'infrastructure
+### Infrastructure prerequisites
 
-À provisionner une fois, avant le premier entraînement distant :
+To provision once, before the first remote run:
 
-1. **Base PostgreSQL dédiée** (Neon) — ne pas réutiliser une base contenant déjà
-   des tables MLflow d'un autre projet : les expériences et les modèles
-   enregistrés se mélangeraient. Utiliser le point de terminaison **direct**
-   (sans `-pooler`) : MLflow crée son schéma par migrations Alembic à la
-   première connexion, ce que le pooler en mode transaction supporte mal.
-2. **Bucket S3** — accès public bloqué, versioning désactivé (c'est MLflow qui
-   versionne, un dossier par run). Sa région est **figée à la création** et doit
-   correspondre exactement à `AWS_DEFAULT_REGION`.
-3. **Utilisateur IAM dédié** avec une politique restreinte à ce seul bucket
-   (`ListBucket` + `GetBucketLocation` sur le bucket, `PutObject` / `GetObject` /
-   `DeleteObject` sur `bucket/*`), plutôt que `AmazonS3FullAccess` — les clés
-   vivent dans un fichier local, autant limiter la portée d'une fuite.
+1. **A dedicated PostgreSQL database** (Neon) — do not reuse one that already holds
+   MLflow tables from another project, or the experiments and registered models
+   would mix. Use the **direct** endpoint (without `-pooler`): MLflow creates its
+   schema through Alembic migrations on first connection, which a transaction-mode
+   pooler handles poorly.
+2. **An S3 bucket** — public access blocked, versioning off (MLflow does the
+   versioning, one folder per run). Its region is **fixed at creation** and must
+   match `AWS_DEFAULT_REGION` exactly.
+3. **A dedicated IAM user** with a policy restricted to that single bucket
+   (`ListBucket` + `GetBucketLocation` on the bucket, `PutObject` / `GetObject` /
+   `DeleteObject` on `bucket/*`) rather than `AmazonS3FullAccess` — the keys live
+   in a local file, so the blast radius of a leak is worth limiting.
 
 ### Configuration
 
-Copier `.env.example` en `.env` et le remplir. Puis :
-
-```powershell
-# PowerShell
-python train.py    # métriques -> Neon, artefacts -> S3
-```
+Copy `.env.example` to `.env` and fill it in. Then:
 
 ```bash
-# bash / Linux
-python train.py
+python train.py    # metrics -> Neon, artifacts -> S3
 ```
 
-Deux lignes de confirmation s'affichent au démarrage :
+Two confirmation lines appear at startup:
 
 ```
-MLflow tracking -> base distante
-Artefacts -> s3://<bucket>/mlflow-artifacts
+MLflow tracking -> remote backend
+Artifacts -> s3://<bucket>/mlflow-artifacts
 ```
 
-La seconde n'apparaît **qu'à la création de l'expérience**. Son absence signifie
-que l'expérience existait déjà — voir l'encadré ci-dessous.
+The second only appears **when the experiment is created**. Its absence means the
+experiment already existed — see the warning below.
 
-### Visualiser les expériences
+### Viewing the experiments
 
-**En local** (aucune variable définie) :
+**Locally** (no variables set):
 
 ```bash
 mlflow ui      # http://localhost:5000
 ```
 
-**Branché sur Neon.** `mlflow ui` est un **processus séparé** qui ne lit pas le
-`.env` : il faut lui passer explicitement l'URI.
+Identical under PowerShell — but a local file store needs an opt-in first:
+
+```powershell
+$env:MLFLOW_ALLOW_FILE_STORE = "true"
+mlflow ui
+```
+
+**Against Neon.** `mlflow ui` is a **separate process** and does not read the
+`.env`: the URI has to be passed explicitly.
 
 ```powershell
 # PowerShell
@@ -139,67 +166,93 @@ export $(grep -v '^#' .env | xargs)
 mlflow ui --backend-store-uri "$MLFLOW_TRACKING_URI"
 ```
 
-Pour consulter aussi l'onglet *Artifacts* d'un run, le serveur a besoin des
-identifiants AWS (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-`AWS_DEFAULT_REGION`) dans son propre environnement.
+To browse a run's *Artifacts* tab as well, the server needs the AWS credentials
+(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`) in its own
+environment. Two stores, two authentications: Neon is enough for metrics and
+parameters, AWS is required to download a model.
 
-> ⚠️ **Piège : `artifact_location` est figé à la création de l'expérience.**
+> ⚠️ **If the runs do not show up.** Three causes, in order. The database name at
+> the end of the URI decides which backend the UI reads — point it at the wrong one
+> and you get an interface that looks fine but lists someone else's experiments.
+> The `&` in a Neon connection string terminates the command under PowerShell; run
+> it from Git Bash or escape it as `%26`. And the search bar keeps filters between
+> sessions: the metric is `test_rmse`, not `rmse`, and `params.model` is `"rf"` or
+> `"linear"`.
+
+> ⚠️ **Trap: `artifact_location` is frozen when the experiment is created.**
 >
-> L'emplacement des artefacts est une **colonne de la table `experiments`**,
-> écrite une seule fois à l'`INSERT` et jamais recalculée. Définir
-> `MLFLOW_ARTIFACT_LOCATION` **après** la création d'une expérience n'a donc
-> aucun effet sur elle — **et sans le moindre message d'erreur**.
+> The artifact location is a **column of the `experiments` table**, written once at
+> `INSERT` and never recomputed. Setting `MLFLOW_ARTIFACT_LOCATION` **after** an
+> experiment exists therefore has no effect on it — **and raises no error**.
 >
-> Corollaire : la variable d'environnement ne s'applique pas d'elle-même, il
-> faut qu'elle soit **transmise** à `create_experiment(name, artifact_location=…)`.
-> C'est ce que fait `setup_experiment()`. L'expérience `Default`, créée en
-> interne par MLflow sans ce paramètre, en donne la contre-épreuve : elle
-> conserve un emplacement local alors que la variable S3 est définie.
+> It follows that the environment variable does not apply by itself: it has to be
+> **passed** to `create_experiment(name, artifact_location=…)`, which is what
+> `setup_experiment()` does. The `Default` experiment, created internally by MLflow
+> without that argument, is the control case: it keeps a local path even when the
+> S3 variable is set.
 >
-> Vérification avant tout entraînement :
+> Check before training:
 > ```python
 > print(mlflow.get_experiment_by_name("getaround-pricing").artifact_location)
 > ```
-> Si le résultat commence par `file:///`, les artefacts restent en local. Il
-> faut alors supprimer l'expérience, ou en utiliser une neuve
-> (`python train.py --experiment getaround-pricing-s3`).
+> If the result starts with `file:///`, artifacts are staying local. Delete the
+> experiment, or use a fresh name (`python train.py --experiment getaround-pricing-s3`).
 
-> 🔐 **Secrets** : l'URL Neon (qui contient un mot de passe) et les clés AWS
-> vivent dans `.env`, non versionné (voir `.gitignore`) — jamais en dur dans le
-> code ni sur GitHub. Ils ne concernent que l'entraînement : l'API déployée sur
-> Hugging Face ne fait aucun tracking MLflow, elle charge un `.joblib` et prédit.
+> 🔐 **Secrets.** The Neon URL (which contains a password) and the AWS keys live in
+> `.env`, unversioned (see `.gitignore`) — never hard-coded, never on GitHub. They
+> concern training only: the deployed API does no MLflow tracking, it loads a
+> `.joblib` and predicts.
 
-> 📦 **Pourquoi deux stockages ?** Une base SQL (Neon) est faite pour la donnée
-> structurée requêtable (chiffres, texte), pas pour des fichiers binaires ; S3
-> est fait pour les fichiers. Neon conserve, pour chaque run, l'URI S3 de ses
-> artefacts (colonne `artifact_uri` de la table `runs`) pour faire le lien.
+> 📦 **Why two stores?** A SQL database (Neon) is built for structured, queryable
+> data — numbers and text — not for binary files; S3 is built for files. Neon keeps,
+> for each run, the S3 URI of its artifacts (the `artifact_uri` column of the `runs`
+> table), which is what links the two.
 
-> Le pipeline est sérialisé **deux fois, indépendamment**, par deux appels que
-> rien ne relie dans `train.py` : `mlflow.sklearn.log_model()` l'envoie vers
-> **S3**, et `joblib.dump()` écrit `artifacts/model.joblib` sur le disque.
-> Deux usages distincts : l'artefact S3 sert la **traçabilité** (il est
-> accompagné de `MLmodel`, `requirements.txt`, `python_env.yaml`, donc
-> rechargeable sur une autre machine avec son environnement) ; le `.joblib`
-> sert le **déploiement**, c'est lui qu'on copie dans l'image Docker de l'API.
+> The pipeline is serialised **twice, independently**, by two calls that nothing in
+> `train.py` connects: `mlflow.sklearn.log_model()` sends one copy to **S3**, and
+> `joblib.dump()` writes `artifacts/model.joblib` to disk. Two distinct purposes:
+> the S3 artifact serves **traceability** (it ships with `MLmodel`,
+> `requirements.txt`, `python_env.yaml`, so it reloads on another machine with its
+> environment); the `.joblib` serves **deployment**, and is what goes into the API's
+> Docker image.
 
-> L'API `/predict` (Partie 3) recharge le .joblib tel quel et lui passe des 
-> caractéristiques **brutes** — tout le prétraitement est embarqué avec le 
-> modèle -> il s'entraîne avec le modèle, il se sérialise avec le modèle, 
-> il se déploie avec le modèle. Le séparer, c'est créer deux artefacts qui 
-> doivent rester synchronisés manuellement — et qui ne le resteront pas.
+> The `/predict` API (Part 3) reloads that `.joblib` as-is and hands it **raw**
+> features — the whole preprocessing travels with the model. It is fitted with the
+> model, serialised with the model, deployed with the model. Separating them would
+> create two artifacts that must stay in sync manually, and would not.
 
-## Évolutions
+## Tests
 
-- **Model Registry** — immédiatement accessible, maintenant que le backend est
-  une base SQL (il ne fonctionne pas avec le file store local). Il ne manque
-  qu'un `mlflow.register_model()` et une politique de promotion
-  Staging → Production. L'API demanderait alors « la version Production » au
-  registre au lieu d'embarquer un fichier figé dans son image.
-  Ici on a préféré le modèle embarqué puisque: contrainte de démo jury, pas de 
-  réentrainement fréquent, un seul service consomme le modèle. 
-- **Monitoring de production** — d'une autre nature : il ne s'agit plus de
-  comparer des entraînements mais de surveiller un modèle qui sert des requêtes
-  réelles (dérive des données, dégradation des performances, latence). Cela
-  suppose de **logger les prédictions de l'API**, ce qu'elle ne fait pas
-  aujourd'hui, et de trouver un proxy métier pour mesurer la qualité — le
-  « vrai » prix optimal n'étant jamais observé a posteriori.
+```bash
+cd model
+pip install pytest
+pytest -q
+```
+
+Eight tests on the pure functions — the ones that only compute. Cleaning removes
+exactly the three implausible rows; the declared feature groups cover every column
+of the dataset (one left out would silently stop being used, with no error
+anywhere); the preprocessor still produces the right shape for a brand it never
+saw, which pins the `handle_unknown="ignore"` the API depends on; and the metrics
+behave, including RMSE never falling below MAE.
+
+`main()` is deliberately left out. Testing it would mean replacing MLflow and the
+filesystem with stand-ins, and what remains to assert once you have is that the
+stand-ins were called — a test of the mock rather than of the code.
+
+## Extensions
+
+- **Model registry** — immediately available now that the backend is a SQL database
+  (it does not work with the local file store). All that is missing is a
+  `mlflow.register_model()` and a Staging → Production promotion policy; the API
+  would then ask the registry for "the Production version" instead of embedding a
+  frozen file in its image. The embedded model was preferred here: no frequent
+  retraining, a single consumer, and no runtime dependency on the tracking stack.
+- **Permutation importance** — impurity-based `feature_importances_` is biased
+  towards high-cardinality features, which after one-hot encoding is exactly what
+  `model_key` is.
+- **Production monitoring** — a different problem altogether: no longer comparing
+  training runs but watching a model serve real requests (data drift, performance
+  decay, latency). It would require **logging the API's predictions**, which it does
+  not do today, and finding a business proxy for quality — the "true" optimal price
+  is never observed after the fact.

@@ -1,230 +1,179 @@
+"""GetAround — train the rental price model.
+
+The one-command version of `02_price_modelling.ipynb`. The notebook explains the
+reasoning; this script replays the training reproducibly and writes the artifact
+the API serves.
+
+    python train.py                                   # linear + random forest
+    python train.py --model rf                        # one model only
+    python train.py --n-estimators 300 --max-depth 20 # other hyperparameters
+    python train.py --experiment getaround-sweep      # a fresh experiment
+
+What it does, in order: resolve where MLflow writes, load and clean the data,
+split, build a scikit-learn pipeline, train and evaluate each model while
+tracking everything, then serialise the best pipeline to `artifacts/`.
+
+The **whole pipeline** is serialised, not just the estimator, so the API can be
+handed raw features and the encoding cannot drift between training and serving.
 """
-=============================================================================
- GetAround — Entraînement du modèle de prédiction du prix de location
-=============================================================================
 
-RÔLE DE CE FICHIER
-------------------
-C'est la version EXÉCUTABLE EN UNE COMMANDE de la démarche racontée pas à pas
-dans le notebook `02_modelisation_pricing.ipynb`. Le notebook sert à
-comprendre et à présenter ; ce script sert à REJOUER l'entraînement de façon
-reproductible — c'est l'esprit "industrialisation" du bloc 5.
+from __future__ import annotations
 
-    python train.py                              # entraîne Linéaire + RandomForest
-    python train.py --model rf                   # un seul modèle
-    python train.py --n-estimators 300 --max-depth 20   # autres hyperparamètres
+import argparse
+import json
+import os
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
 
-CE QUE FAIT LE SCRIPT, DANS L'ORDRE
------------------------------------
-  1. choisit OÙ MLflow enregistre (base distante Neon / S3, ou repli local) ;
-  2. charge et NETTOIE les données (3 lignes aberrantes retirées) ;
-  3. découpe train / test ;
-  4. construit un PIPELINE scikit-learn (prétraitement + modèle) ;
-  5. entraîne chaque modèle, l'évalue (RMSE / MAE / R²) et TRACE tout dans MLflow ;
-  6. sérialise le MEILLEUR modèle dans artifacts/model.joblib
-     -> c'est CE fichier que l'API /predict recharge en Partie 3.
-
-POURQUOI UN PIPELINE ET PAS JUSTE UN MODÈLE
---------------------------------------------------------------------
-On sérialise le pipeline COMPLET (prétraitement + modèle). Ainsi l'API reçoit
-des caractéristiques BRUTES ("Citroën", "diesel", 140000 km) et l'encodage
-s'applique tout seul, exactement comme à l'entraînement. Si on ne sauvegardait
-que le RandomForest, il faudrait redupliquer toute la logique d'encodage côté
-API -> source d'incohérences ("train/serving skew").
-=============================================================================
-"""
-# --- Bibliothèque standard ---------------------------------------------------
-import argparse          # lecture des options passées en ligne de commande
-import os                # accès aux variables d'environnement (secrets, config)
-from pathlib import Path # manipulation de chemins, portable Windows/Linux/macOS
-
-# --- Bibliothèques tierces ---------------------------------------------------
-import joblib            # sérialisation (écrire/relire le modèle sur disque)
+import joblib
+import mlflow
+import mlflow.sklearn
 import numpy as np
 import pandas as pd
-import mlflow            # suivi des expériences
-import mlflow.sklearn    # sous-module : sait logger un modèle scikit-learn
-from dotenv import load_dotenv   # lecture OPTIONNELLE d'un .env local
-
-from sklearn.compose import ColumnTransformer      # traitement PAR TYPE de colonne
+import sklearn
+from dotenv import load_dotenv
+from mlflow.models import infer_signature
+from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline              # enchaîne prétraitement -> modèle
+from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-
-# =============================================================================
-# CONSTANTES
-# =============================================================================
-
-# Path(__file__) = le chemin de CE fichier ; .parent = le dossier qui le contient.
-# On construit donc tous les chemins EN RELATIF par rapport au script lui-même :
-# il fonctionne quel que soit le dossier depuis lequel on le lance, et sans
-# aucun chemin absolu en dur (portable : machine locale, conteneur Docker...).
-HERE = Path(__file__).parent
-
-# --- Chargement du .env : COMMODITÉ LOCALE, PAS UN MÉCANISME DE PRODUCTION ----
-# En production (conteneur Docker, Space Hugging Face, ECS...), les variables
-# d'environnement sont INJECTÉES PAR LA PLATEFORME : il n'y a pas de fichier
-# .env, et cet appel ne trouve rien -> il ne fait simplement rien, sans erreur.
-# En local, il évite d'avoir à retaper les variables à chaque nouveau terminal.
-#
-# override=False (le défaut, écrit ici pour que l'intention soit explicite) :
-# une variable DÉJÀ présente dans l'environnement N'EST PAS écrasée par le .env.
-# C'est la sémantique de production : la plateforme a toujours le dernier mot,
-# et un `$env:MLFLOW_TRACKING_URI = ...` posé à la main pour un test ponctuel
-# prime sur le fichier.
-#
-# Le code métier, lui, ne lit QUE os.environ : il ignore d'où viennent les
-# valeurs. C'est ce qui rend le script identique en local et en production.
-load_dotenv(HERE / ".env", override=False)
-
+# Every path is relative to this file, so the script runs from any working
+# directory and holds inside a container.
+HERE = Path(__file__).parent.resolve()
 DATA_PATH = HERE / "data" / "get_around_pricing_project.csv"
 ARTIFACT_DIR = HERE / "artifacts"
 
-# La CIBLE : la variable que le modèle doit apprendre à prédire.
-TARGET = "rental_price_per_day"
+# Loading the .env is a local convenience, not a production mechanism: in a
+# container the platform injects the variables, no file is found, and this call
+# does nothing. `override=False` is the default, written out because the
+# intention matters — a variable already set in the environment always wins over
+# the file, which is the production semantics.
+load_dotenv(HERE / ".env", override=False)
 
-# Les FEATURES, regroupées par type. Ce découpage n'est pas cosmétique :
-# c'est lui qui aiguille chaque colonne vers le bon prétraitement (voir plus bas).
+RANDOM_STATE = 42
+
+TARGET = "rental_price_per_day"
 NUMERIC = ["mileage", "engine_power"]
 CATEGORICAL = ["model_key", "fuel", "paint_color", "car_type"]
-BOOLEAN = ["private_parking_available", "has_gps", "has_air_conditioning",
-           "automatic_car", "has_getaround_connect", "has_speed_regulator",
-           "winter_tires"]
+BOOLEAN = [
+    "private_parking_available", "has_gps", "has_air_conditioning",
+    "automatic_car", "has_getaround_connect", "has_speed_regulator",
+    "winter_tires",
+]
 
 
-# =============================================================================
-# 1. CONFIGURATION MLFLOW (où atterrissent les runs et les artefacts)
-# =============================================================================
+# ---------------------------------------------------------------------------
+# MLflow configuration
+# ---------------------------------------------------------------------------
 
 def get_tracking_uri() -> str:
-    """
-    Choisit OÙ MLflow enregistre les runs, SANS modifier le reste du code :
-      - si la variable d'environnement MLFLOW_TRACKING_URI est définie
-        (ex. une base PostgreSQL/Neon) -> on l'utilise ;
-      - sinon -> repli sur le dossier local mlruns/ (filet de sécurité démo).
+    """Remote backend if `MLFLOW_TRACKING_URI` is set, local `mlruns/` otherwise.
 
-    L'intérêt : on bascule base distante <-> local en (dé)définissant une simple
-    variable d'environnement, jamais en touchant au code. Et le jour où le
-    réseau lâche pendant une démo, on retombe automatiquement en local.
+    Switching between a remote database and local files is a matter of setting
+    an environment variable, never of editing code — and a demo survives a
+    network outage by falling back on its own.
 
-    SECRET : l'URL Neon contient un mot de passe. Elle vit dans un fichier
-    .env NON versionné (voir .gitignore et .env.example), jamais ici.
+    The Neon URI contains a password and lives in an unversioned `.env`.
     """
-    uri = os.environ.get("MLFLOW_TRACKING_URI")   # None si la variable n'existe pas
+    uri = os.environ.get("MLFLOW_TRACKING_URI")
     if uri:
         return uri
 
-    # Repli local. MLflow 3.x a mis le "file store" (dossier mlruns/) en mode
-    # maintenance et lève une erreur par défaut ; cette variable est l'opt-in
-    # officiel pour continuer à l'utiliser. setdefault = "ne pose la valeur que
-    # si elle n'est pas déjà définie" (on n'écrase pas un réglage existant).
+    # MLflow 3.x put the file store in maintenance mode and raises by default;
+    # this variable is the documented opt-in. setdefault leaves an existing
+    # value alone.
     os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
-
-    # Le préfixe "file:" indique à MLflow qu'il s'agit d'un dossier local.
-    # as_posix() normalise le chemin avec des "/" (utile sous Windows).
     return f"file:{(HERE / 'mlruns').as_posix()}"
 
 
-def setup_experiment(name: str = "getaround-pricing") -> None:
-    """
-    Sélectionne (ou crée) l'expérience MLflow et choisit OÙ vont les ARTEFACTS
-    (le modèle loggé, les fichiers) :
-      - si MLFLOW_ARTIFACT_LOCATION est défini (ex. 's3://bucket/mlflow-artifacts')
-        -> les artefacts partent sur S3 (via boto3 + identifiants AWS) ;
-      - sinon -> emplacement par défaut (local).
+def setup_experiment(name: str) -> None:
+    """Select or create the experiment, sending artifacts to S3 when configured.
 
-    RAPPEL DU PARTAGE DES RÔLES (MLflow sépare DEUX stockages) :
-      - backend store  (PostgreSQL/Neon) -> métriques, paramètres, métadonnées
-        = tout ce qui est structuré et requêtable, "ce qui tient dans un tableur" ;
-      - artifact store (S3)              -> modèles et fichiers lourds,
-        parce qu'une base SQL n'est pas faite pour stocker du binaire.
-      Le backend conserve, pour chaque run, l'URI S3 de ses artefacts : c'est
-      ce qui fait le lien entre les deux.
+    MLflow keeps two stores: the backend (PostgreSQL) holds metrics, parameters
+    and metadata — everything structured and queryable — while the artifact
+    store (S3) holds models and other large files, because a SQL database is the
+    wrong place for binaries. Each run row in the backend carries the S3 URI of
+    its own artifacts, which is what links the two.
 
-    ⚠️ PIÈGE À CONNAÎTRE : artifact_location est FIGÉ À LA CRÉATION de
-    l'expérience. Si l'expérience existe déjà (créée en local), elle GARDE son
-    ancien emplacement d'artefacts même si tu définis la variable S3 ensuite.
-    Pour basculer vraiment vers S3, il faut une expérience neuve.
+    `artifact_location` is written once, when the experiment is created, and is
+    never recomputed. An experiment first created locally keeps its local
+    artifact path even after the S3 variable is set, silently. Switching to S3
+    means using a new experiment name — which is what `--experiment` is for.
     """
-    
-    # On lit la variable d'environnement. .get() renvoie None si elle n'existe pas
-    # (contrairement à os.environ["..."] qui lèverait une erreur).
-    # si None -> MLflow utilisera son emplacement d'artefacts par défaut (local).
     artifact_location = os.environ.get("MLFLOW_ARTIFACT_LOCATION")
 
-    # On demande à MLflow : "cette EXP existe-t-elle déjà dans Neon (une ligne avec ce name) ?"
-    # Réponse None → create_experiment fait l'INSERT de cette EXP dans Neon, avec l'artifact_location S3. 
-    # Puis set_experiment sélectionne cette EXP pour les runs qui suivent
-    exp = mlflow.get_experiment_by_name(name)
-
-    if exp is None:                    # elle n'existe pas -> on la crée
+    if mlflow.get_experiment_by_name(name) is None:
         mlflow.create_experiment(name, artifact_location=artifact_location)
-        if artifact_location:          # on ne l'affiche que si S3 est configuré
-            print(f"Artefacts -> {artifact_location}")
+        if artifact_location:
+            print(f"Artifacts -> {artifact_location}")
 
-    # Dans les deux cas (créée à l'instant OU déjà existante), on l'ouvre.
     mlflow.set_experiment(name)
 
 
-# =============================================================================
-# 2. DONNÉES : chargement et nettoyage
-# =============================================================================
+def git_commit() -> str | None:
+    """Short commit hash, or None outside a repository.
+
+    Logged as a tag so a run can be traced back to the code that produced it —
+    the cheapest half of reproducibility, the other half being the seed.
+    """
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=HERE, stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
 
 def load_and_clean(path: Path = DATA_PATH) -> pd.DataFrame:
-    """
-    Charge le CSV et retire les 3 lignes aberrantes repérées pendant l'EDA.
+    """Load the CSV and drop the three implausible rows found during the EDA.
 
-    index_col=0 : la première colonne du fichier est un index sans nom
-    (une simple numérotation des voitures), on l'utilise comme index plutôt
-    que de la traiter comme une variable explicative.
+    A negative mileage is impossible, a mileage above one million is a typing
+    error, and a car does not have zero horsepower. They are dropped rather than
+    imputed: three rows out of 4,843 are too few to justify a correction, and
+    keeping them means fitting on noise.
+
+    `index_col=0` treats the unnamed first column as the index rather than as a
+    feature.
     """
     df = pd.read_csv(path, index_col=0)
     before = len(df)
 
-    # Les 3 anomalies identifiées à l'exploration (0,06 % des données) :
-    #   - un mileage NÉGATIF        -> physiquement impossible ;
-    #   - un mileage > 1 000 000 km -> valeur absurde (erreur de saisie) ;
-    #   - un engine_power = 0       -> une voiture n'a pas 0 cheval.
-    # On les supprime plutôt que de les imputer : elles sont trop peu nombreuses
-    # pour justifier une correction, et les garder ferait apprendre du bruit.
     df = df[(df.mileage >= 0) & (df.mileage < 1_000_000) & (df.engine_power > 0)]
 
-    print(f"Nettoyage : {before - len(df)} ligne(s) retirée(s) -> {len(df)} restantes")
+    print(f"Cleaning: {before - len(df)} row(s) dropped -> {len(df)} remaining")
     return df
 
 
-# =============================================================================
-# 3. PRÉTRAITEMENT ET MODÈLES
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Preprocessing and models
+# ---------------------------------------------------------------------------
 
 def build_preprocessor() -> ColumnTransformer:
-    """
-    Prétraitement par TYPE de colonne, regroupé dans un seul objet.
+    """One transformation per column type, in a single object.
 
-      - numériques    -> StandardScaler : centre (moyenne 0) et réduit (écart-type 1).
-                         Utile surtout pour la régression linéaire, qui est
-                         sensible aux échelles ; sans effet néfaste sur les arbres.
+    Numeric columns are standardised, which matters for the linear model and is
+    harmless for the trees. Categorical columns are one-hot encoded, since a
+    model only handles numbers. Booleans pass through: they are already 0/1.
 
-      - catégorielles -> OneHotEncoder : transforme "diesel"/"petrol"... en
-                         colonnes binaires (une par modalité), car un modèle ne
-                         sait manipuler que des nombres.
-                         handle_unknown="ignore" est CRUCIAL en production :
-                         si l'API reçoit une marque jamais vue à l'entraînement,
-                         l'encodeur met des 0 partout au lieu de LEVER UNE ERREUR
-                         et de faire planter le service.
+    `handle_unknown="ignore"` keeps the encoder from raising when the API sends
+    a category that was not in the training data. The trade-off is that the
+    unknown value is encoded as all-zeros and scored silently, so the API
+    validates incoming categories against this encoder before predicting.
 
-      - booléennes    -> "passthrough" : laissées telles quelles, elles sont
-                         déjà en 0/1, il n'y a rien à transformer.
-
-    ⚠️ POURQUOI DANS UN PIPELINE : ces transformations APPRENNENT des paramètres
-    sur les données (moyenne/écart-type pour le scaler, liste des modalités pour
-    l'encodeur). Dans un Pipeline, cet apprentissage se fait sur le TRAIN seul,
-    puis est réappliqué à l'identique au test et en production -> pas de fuite
-    de données (data leakage).
+    Wrapping this in a Pipeline is what prevents leakage: these transformations
+    learn parameters — means, standard deviations, category lists — and inside a
+    pipeline they learn them on the training fold alone, then replay them
+    unchanged on the test set and in production.
     """
     return ColumnTransformer(
         transformers=[
@@ -235,199 +184,220 @@ def build_preprocessor() -> ColumnTransformer:
     )
 
 
-def get_model(name: str, n_estimators: int, max_depth):
-    """
-    Renvoie l'estimateur demandé.
+def get_model(name: str, n_estimators: int, max_depth: int | None):
+    """Return the requested estimator.
 
-      - "linear" : LinearRegression, la BASELINE. Elle sert de référence :
-        c'est le minimum à battre. Un modèle sophistiqué qui ne bat pas une
-        régression linéaire ne se justifie pas.
+    `linear` is the baseline: a sophisticated model that cannot beat a linear
+    regression does not justify itself.
 
-      - "rf" : RandomForestRegressor, une forêt d'arbres de décision. Capte les
-        relations NON LINÉAIRES et les interactions entre variables.
-          * n_estimators = nombre d'arbres (plus = plus stable, mais plus lourd) ;
-          * max_depth    = profondeur maximale de chaque arbre. La plafonner
-            LIMITE LE SURAPPRENTISSAGE : sans limite, les arbres mémorisent le
-            train. Ici max_depth=12 donne un RMSE de test légèrement MEILLEUR
-            qu'en illimité, et fait passer le fichier de 62 Mo à ~2 Mo ;
-          * random_state=42 : fige l'aléa (tirage des échantillons et des
-            variables) -> résultats REPRODUCTIBLES d'une exécution à l'autre ;
-          * n_jobs=-1 : utilise tous les cœurs du processeur (entraînement plus rapide).
+    `rf` is a random forest, which captures non-linearities and interactions.
+    Capping `max_depth` limits overfitting — at 12 the test RMSE is marginally
+    better than with unlimited depth, and the serialised file drops from about
+    62 MB to 2 MB, which is a deployment decision as much as a statistical one.
     """
     if name == "linear":
         return LinearRegression()
     if name == "rf":
         return RandomForestRegressor(
-            n_estimators=n_estimators, max_depth=max_depth,
-            random_state=42, n_jobs=-1,
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
         )
-    raise ValueError(f"Modèle inconnu : {name}")
+    raise ValueError(f"Unknown model: {name}")
 
 
-# =============================================================================
-# 4. ÉVALUATION
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
 
-def evaluate(y_true, y_pred) -> dict:
+def evaluate(y_true, y_pred) -> dict[str, float]:
+    """Return RMSE, MAE and R².
+
+    RMSE squares the errors, so large misses weigh far more, and the square root
+    brings the result back to euros. MAE weighs every error proportionally and
+    is the figure to quote to a business audience: on average we land about 11 €
+    from the real price. R² situates overall quality without a unit, from 0 (no
+    better than predicting the mean) to 1.
+
+    RMSE is mathematically always at least MAE, so their order says nothing;
+    their ratio does. About 1.55 here, which reflects a spread in the errors
+    rather than one catastrophic miss.
+
+    The same metrics are computed on train and on test: the gap between them is
+    how overfitting shows up.
     """
-    Calcule les trois métriques de régression, regroupées dans un dictionnaire.
-
-      - RMSE : racine de la moyenne des erreurs AU CARRÉ. Le carré fait que les
-        GROSSES erreurs pèsent beaucoup plus ; la racine ramène le résultat en
-        euros, donc lisible. C'est la métrique de référence en régression.
-
-      - MAE : moyenne des erreurs en VALEUR ABSOLUE. Toutes les erreurs comptent
-        proportionnellement. C'est la plus parlante pour le métier :
-        "en moyenne, on tombe à ~11 € du vrai prix".
-
-      - R² : proportion de variance expliquée, de 0 (= ne fait pas mieux que
-        prédire la moyenne) à 1 (= parfait). Sans unité, il situe la qualité globale.
-
-    À SAVOIR : la RMSE est TOUJOURS >= la MAE (propriété mathématique). Ce n'est
-    donc pas leur ordre qui informe, mais leur RATIO : ici ~17/11 = 1,55, ce qui
-    traduit une dispersion des erreurs (quelques prédictions nettement moins bonnes).
-
-    NOTE MÉTHODO : on renvoie les mêmes métriques pour le TRAIN et le TEST.
-    Comparer les deux est le moyen de détecter un surapprentissage : un score
-    excellent sur le train mais médiocre sur le test = le modèle a mémorisé.
-    """
-    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
     return {
-        "rmse": rmse,
+        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
         "mae": float(mean_absolute_error(y_true, y_pred)),
         "r2": float(r2_score(y_true, y_pred)),
     }
 
 
-# =============================================================================
-# 5. PROGRAMME PRINCIPAL
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
-def main():
-    # --- Options de la ligne de commande -------------------------------------
-    # argparse permet de changer les réglages SANS éditer le code :
-    #   python train.py --model rf --n-estimators 300
-    # Chaque option a une valeur par défaut, donc `python train.py` seul marche.
-    parser = argparse.ArgumentParser()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", choices=["linear", "rf", "both"], default="both")
     parser.add_argument("--n-estimators", type=int, default=100)
-    parser.add_argument("--max-depth", type=int, default=12)
+    parser.add_argument("--max-depth", type=int, default=12,
+                        help="Maximum tree depth; -1 for unlimited.")
     parser.add_argument("--test-size", type=float, default=0.2)
+    parser.add_argument("--cv", type=int, default=5,
+                        help="Folds for cross-validated RMSE; 0 to skip.")
     parser.add_argument("--experiment", default="getaround-pricing",
-                        help="Nom de l'expérience MLflow. En changer force une "
-                             "nouvelle création, donc une nouvelle artifact_location "
-                             "(indispensable pour basculer vers S3).")
+                        help="MLflow experiment name. A new name forces a new "
+                             "experiment, and therefore a new artifact_location "
+                             "— the only way to switch existing runs to S3.")
+    parser.add_argument("--output", type=Path, default=ARTIFACT_DIR / "model.joblib",
+                        help="Where to write the serialised pipeline.")
     args = parser.parse_args()
+    if args.max_depth == -1:
+        args.max_depth = None
+    return args
 
-    # --- Configuration du suivi MLflow ---------------------------------------
+
+def main() -> None:
+    args = parse_args()
+
     uri = get_tracking_uri()
     mlflow.set_tracking_uri(uri)
-    # On affiche le backend retenu : très utile pour vérifier d'un coup d'œil
-    # si on logge en local ou dans la base distante.
-    backend = "base distante" if uri.startswith(("postgresql", "sqlite", "http")) else "local (mlruns/)"
+    backend = "remote backend" if uri.startswith(("postgresql", "sqlite", "http")) else "local (mlruns/)"
     print(f"MLflow tracking -> {backend}")
-    setup_experiment(args.experiment)     # au lieu de setup_experiment("getaround-pricing")
+    setup_experiment(args.experiment)
 
-    # --- Données -------------------------------------------------------------
     df = load_and_clean()
-    X = df[NUMERIC + CATEGORICAL + BOOLEAN]   # les variables explicatives
-    y = df[TARGET]                            # la cible à prédire
+    X = df[NUMERIC + CATEGORICAL + BOOLEAN]
+    y = df[TARGET]
 
-    # NOTE : on entraîne sur la cible BRUTE (en euros), sans transformation log.
-    # Ce choix a été TESTÉ, pas supposé : la distribution des prix est quasi
-    # symétrique (moyenne 121 ~ médiane 119, skewness 0,61), et entraîner sur
-    # log(prix) DÉGRADE les métriques (RMSE 17,7 vs 17,0). Le log corrige une
-    # forte asymétrie ; il n'y en a pas ici, donc il déforme sans rien réparer.
+    # The target is trained on raw euros, with no log transform. That was tested
+    # rather than assumed: the price distribution is close to symmetric (mean
+    # 121 against median 119, skewness 0.61) and training on log(price) makes
+    # every metric worse (RMSE 17.7 against 17.0). A log corrects strong skew;
+    # there is none here, so it distorts without fixing anything.
 
-    # Découpage train / test :
-    #   - le TEST est mis de côté et ne sert QUE pour l'évaluation finale, sur
-    #     des voitures que le modèle n'a jamais vues -> mesure honnête ;
-    #   - random_state=42 fige le tirage : le même découpage à chaque exécution,
-    #     donc des scores comparables entre deux entraînements.
+    # The test set is held out and only touched for the final evaluation, on
+    # cars the model has never seen. A fixed seed keeps the split identical
+    # between runs, so two trainings stay comparable.
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=args.test_size, random_state=42
+        X, y, test_size=args.test_size, random_state=RANDOM_STATE
     )
 
-    # --- Entraînement des modèles --------------------------------------------
-    models = ["linear", "rf"] if args.model == "both" else [args.model]
+    # Predicting the training median: the error any model has to beat. Without
+    # it, an R² of 0.75 is hard to place.
+    baseline_rmse = float(np.sqrt(mean_squared_error(y_test, np.full(len(y_test), y_train.median()))))
+    print(f"Predict-the-median baseline -> test RMSE={baseline_rmse:.2f}")
 
-    # On garde trace du meilleur modèle au fil de la boucle. On l'initialise
-    # avec un RMSE infini pour que le tout premier modèle testé le batte
-    # forcément (astuce classique de recherche de minimum).
-    best = {"rmse": np.inf, "pipe": None, "name": None}
+    models = ["linear", "rf"] if args.model == "both" else [args.model]
+    commit = git_commit()
+
+    best = {"rmse": np.inf, "pipe": None, "name": None, "metrics": None}
 
     for name in models:
-        # `with mlflow.start_run(...)` ouvre un RUN : tout ce qui est loggé à
-        # l'intérieur du bloc y est rattaché, et le run est proprement fermé à
-        # la sortie du bloc (même en cas d'erreur). Un run = un entraînement.
-        
-        # Nom du run : par défaut le nom du modèle ("linear" / "rf"). Lors d'un
-        # BALAYAGE d'hyperparamètres, plusieurs runs partagent le même `name` et
-        # deviennent indiscernables dans l'interface -> on suffixe la forêt par
-        # sa profondeur ("rf-d4", "rf-d8"...). La régression linéaire n'a pas
-        # d'hyperparamètre, elle garde son nom simple.
-        run_name = f"{name}-d{args.max_depth}" if name == "rf" else name
-        with mlflow.start_run(run_name=name):
+        # During a hyperparameter sweep several runs share the same model name
+        # and become indistinguishable in the UI, so the forest is suffixed with
+        # its depth ("rf-d4", "rf-d8"). The linear model has no hyperparameter
+        # and keeps its plain name.
+        depth = "none" if args.max_depth is None else args.max_depth
+        run_name = f"{name}-d{depth}" if name == "rf" else name
 
-            # Le PIPELINE : prétraitement puis modèle, en série. L'appel à
-            # .fit() enchaîne tout automatiquement, dans le bon ordre.
+        # Everything logged inside the block belongs to this run, and the run is
+        # closed cleanly on the way out, including on an exception.
+        with mlflow.start_run(run_name=run_name):
             pipe = Pipeline([
                 ("preprocessor", build_preprocessor()),
                 ("model", get_model(name, args.n_estimators, args.max_depth)),
             ])
             pipe.fit(X_train, y_train)
 
-            # Évaluation sur les deux jeux : l'écart train/test révèle un
-            # éventuel surapprentissage.
-            train_m = evaluate(y_train, pipe.predict(X_train))
-            test_m = evaluate(y_test, pipe.predict(X_test))
+            train_metrics = evaluate(y_train, pipe.predict(X_train))
+            test_metrics = evaluate(y_test, pipe.predict(X_test))
 
-            # --- Traçage MLflow ---
-            # log_param  : une valeur de CONFIGURATION (fixée avant l'entraînement)
-            # log_metric : une valeur MESURÉE (résultat de l'entraînement)
-            # log_model  : le modèle lui-même (part dans l'artifact store)
-            mlflow.log_param("model", name)
-            mlflow.log_param("n_rows", len(df))
-            if name == "rf":   # ces hyperparamètres n'existent que pour la forêt
-                mlflow.log_param("n_estimators", args.n_estimators)
-                mlflow.log_param("max_depth", args.max_depth)
+            mlflow.log_params({
+                "model": name,
+                "n_rows": len(df),
+                "test_size": args.test_size,
+                "random_state": RANDOM_STATE,
+            })
+            if name == "rf":
+                mlflow.log_params({
+                    "n_estimators": args.n_estimators,
+                    "max_depth": depth,
+                })
 
-            # On préfixe par train_/test_ pour pouvoir comparer les deux
-            # dans l'interface MLflow.
-            for k, v in train_m.items():
-                mlflow.log_metric(f"train_{k}", v)
-            for k, v in test_m.items():
-                mlflow.log_metric(f"test_{k}", v)
+            # Prefixed so the two can be compared in the MLflow UI.
+            for key, value in train_metrics.items():
+                mlflow.log_metric(f"train_{key}", value)
+            for key, value in test_metrics.items():
+                mlflow.log_metric(f"test_{key}", value)
+            mlflow.log_metric("baseline_test_rmse", baseline_rmse)
 
-            mlflow.sklearn.log_model(pipe, name="model")
+            if args.cv:
+                # Tells us whether the single split is representative or whether
+                # the score moved with the seed.
+                cv_rmse = -cross_val_score(
+                    pipe, X_train, y_train, cv=args.cv,
+                    scoring="neg_root_mean_squared_error",
+                )
+                mlflow.log_metric("cv_rmse_mean", cv_rmse.mean())
+                mlflow.log_metric("cv_rmse_std", cv_rmse.std())
 
-            print(f"\n[{name}]  test RMSE={test_m['rmse']:.2f}  "
-                  f"MAE={test_m['mae']:.2f}  R²={test_m['r2']:.3f}")
+            mlflow.set_tags({
+                "sklearn_version": sklearn.__version__,
+                "git_commit": commit or "unknown",
+            })
 
-            # Sélection du meilleur : on compare sur le RMSE de TEST (jamais du
-            # train, qui favoriserait le modèle le plus surappris).
-            if test_m["rmse"] < best["rmse"]:
-                best = {"rmse": test_m["rmse"], "pipe": pipe, "name": name}
+            # The signature records the expected input and output schema, so
+            # anyone loading this model later sees what it takes without reading
+            # the training code. MLflow warns that the integer columns cannot
+            # carry missing values; that is fine here, because the API declares
+            # them as required int fields and rejects a payload without them.
+            mlflow.sklearn.log_model(
+                pipe,
+                name="model",
+                signature=infer_signature(X_train, pipe.predict(X_train.head())),
+                input_example=X_train.head(),
+            )
 
-    # --- Sérialisation du meilleur modèle pour l'API (Partie 3) --------------
-    # mkdir(exist_ok=True) : crée le dossier s'il n'existe pas, sans erreur s'il
-    # existe déjà.
-    ARTIFACT_DIR.mkdir(exist_ok=True)
-    out = ARTIFACT_DIR / "model.joblib"
+            line = (f"[{run_name}]  test RMSE={test_metrics['rmse']:.2f}  "
+                    f"MAE={test_metrics['mae']:.2f}  R²={test_metrics['r2']:.3f}")
+            if args.cv:
+                line += f"  |  CV RMSE={cv_rmse.mean():.2f} ± {cv_rmse.std():.2f}"
+            print(line)
 
-    # joblib.dump = SÉRIALISATION : on fige l'objet Python (ici le pipeline
-    # ENTIER, prétraitement inclus) dans un fichier réutilisable sans
-    # réentraînement. L'API fera l'opération inverse avec joblib.load().
-    # compress=3 : compression -> ~2 Mo au lieu de ~62 Mo, plus simple à
-    # versionner et à déployer.
-    joblib.dump(best["pipe"], out, compress=3)
+            # Selected on test RMSE, never on train, which would reward the most
+            # overfitted model.
+            if test_metrics["rmse"] < best["rmse"]:
+                best = {"rmse": test_metrics["rmse"], "pipe": pipe,
+                        "name": name, "metrics": test_metrics}
 
-    print(f"\n✅ Meilleur modèle : {best['name']} (RMSE={best['rmse']:.2f})")
-    print(f"   Sérialisé dans : {out}")
+    # Serialise for the API. This is a second, independent serialisation: MLflow
+    # logged its own copy above for traceability, and nothing links the two
+    # calls — which is why the API keeps working if the tracking stack is down.
+    # compress=3 brings the file down to about 2 MB.
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(best["pipe"], args.output, compress=3)
+
+    # Written next to the artifact so that whoever finds the .joblib later can
+    # tell what it is. The scikit-learn version is the important field: a
+    # pickle only reloads reliably under the version that wrote it.
+    metadata = {
+        "model": best["name"],
+        "metrics": best["metrics"],
+        "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "sklearn_version": sklearn.__version__,
+        "git_commit": commit,
+        "n_rows": len(df),
+        "random_state": RANDOM_STATE,
+    }
+    args.output.with_suffix(".json").write_text(json.dumps(metadata, indent=2))
+
+    print(f"\nBest model: {best['name']} (test RMSE={best['rmse']:.2f})")
+    print(f"Serialised to: {args.output}")
+    print("Copy it to api/model.joblib and rebuild the image to update the served model.")
 
 
-# Cette condition signifie : "n'exécute main() que si ce fichier est lancé
-# DIRECTEMENT (python train.py)". Si un autre script fait `import train` pour
-# réutiliser une fonction (comme le fait le notebook), main() ne se déclenche pas.
 if __name__ == "__main__":
     main()

@@ -8,109 +8,112 @@ app_port: 7860
 pinned: false
 ---
 
-# GetAround — Dashboard d'analyse des délais
+# GetAround — Delay Analysis Dashboard
 
-Dashboard interactif qui quantifie l'impact des retours tardifs sur la location
-suivante, et simule l'effet d'un **délai minimum entre deux locations** ainsi que
-son périmètre d'application (toutes les voitures ou Connect uniquement).
+Interactive dashboard that quantifies the impact of late returns on the next
+rental, and simulates the effect of a **minimum delay between two rentals** along
+with its scope (all cars, or Connect only).
 
-Construit avec Streamlit et Plotly, servi via Docker sur Hugging Face Spaces.
+Built with Streamlit and Plotly, served through Docker on Hugging Face Spaces.
 
-**URL de production :** https://alexbarbier-getaround-dashboard.hf.space
+**Production URL:** https://alexbarbier-getaround-dashboard.hf.space
 
-## Ce que montre le dashboard
+## What the dashboard shows
 
-1. **Fréquence des retards** — distribution et gravité des délais au retour.
-2. **Impact sur le conducteur suivant** — taux d'impact par type de check-in et
-   surcroît d'annulations.
-3. **Simulateur de seuil** — arbitrage en direct entre problèmes résolus et
-   locations bloquées.
-4. **Lecture des données** — plage de seuil recommandée pour un test A/B.
+1. **How often cars come back late** — distribution and severity of checkout delays.
+2. **What it does to the next driver** — impact rate by check-in type, and the
+   cancellation gap that follows.
+3. **Threshold simulator** — live trade-off between problems solved and bookings
+   blocked.
+4. **Reading of the data** — the recommended threshold range, to be A/B tested.
 
-## Contenu du dossier
+## Folder contents
 
 ```
 dashboard/
-├── app.py           # interface Streamlit (affichage uniquement)
-├── utils.py         # chargement des données et calculs métier
+├── app.py           # Streamlit interface (rendering only)
+├── utils.py         # data loading and business logic
+├── test_utils.py    # 16 tests on the business logic
+├── test_app.py      # 7 smoke tests, renders the app without a browser
 ├── data/            # get_around_delay_analysis.xlsx
-├── .streamlit/      # configuration (thème, options serveur)
-├── requirements.txt # dépendances Python
-├── Dockerfile       # environnement d'exécution
-├── FICHE_JURY.md    # note de synthèse
-└── README.md        # ce fichier (son entête YAML configure le Space)
+├── .streamlit/      # configuration (theme, server options)
+├── requirements.txt # Python dependencies
+├── Dockerfile       # runtime environment
+└── README.md        # this file (its YAML header configures the Space)
 ```
 
-La séparation `app.py` / `utils.py` est délibérée : le premier ne fait que de
-l'affichage, le second porte toute la logique de calcul. Cela rend les métriques
-testables indépendamment de l'interface.
+The `app.py` / `utils.py` split is deliberate: the first only renders, the second
+carries every computation. That is what makes the metrics testable independently
+of the interface — `test_utils.py` never starts Streamlit.
 
 ---
 
-# Utilisation
+# Running it
 
-Trois façons de faire tourner ce dashboard, de la plus légère à la plus proche de
-la production. Les étapes 1 et 2 servent à valider avant de déployer à l'étape 3.
+Three ways, from the lightest to the closest to production. Steps 1 and 2 are how
+you validate before deploying at step 3.
 
-## 1. En local, sans Docker
+## 1. Locally, without Docker
+
+Requires Python 3.11 and an activated virtual environment.
 
 ```bash
-cd dashboard/
+cd dashboard
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Streamlit ouvre automatiquement le navigateur sur **http://localhost:8501**, son
-port par défaut.
+Streamlit opens the browser automatically on **http://localhost:8501**, its default
+port.
 
-## 2. En local, avec Docker
+## 2. Locally, with Docker
 
-Reproduit exactement l'environnement du Space. Si cette étape passe, le
-déploiement passera.
+Reproduces the Space environment exactly. If this step passes, the deployment will
+too.
 
 ```bash
-cd dashboard/
+cd dashboard
 docker build -t getaround-dashboard .
 docker run -p 7860:7860 --rm getaround-dashboard
 ```
 
-Ouvrir ensuite **http://localhost:7860**.
+Then open **http://localhost:7860**.
 
-> **Pourquoi 7860 ici et 8501 juste au-dessus ?** Hugging Face Spaces attend que
-> l'application écoute sur le port déclaré dans `app_port` de l'entête YAML. Le
-> `Dockerfile` fige donc ce port dans sa commande de démarrage :
+> **Why 7860 here and 8501 above?** Hugging Face Spaces expects the application to
+> listen on the port declared in the `app_port` YAML header. The `Dockerfile`
+> therefore pins that port in its start command:
 >
 > ```dockerfile
 > CMD ["streamlit", "run", "app.py", "--server.port", "7860", "--server.address", "0.0.0.0"]
 > ```
 >
-> Le `--server.address 0.0.0.0` est indispensable : par défaut Streamlit n'accepte
-> que les connexions venant de l'intérieur du conteneur, et le proxy de Hugging
-> Face ne pourrait pas le joindre.
+> `--server.address 0.0.0.0` is required: by default Streamlit only accepts
+> connections from inside the container, and the Hugging Face proxy could not
+> reach it.
 >
-> Le `-p 7860:7860` mappe ce port du conteneur vers le même port de ta machine.
-> Attention : ce port est aussi celui du conteneur de l'API. Ne pas lancer les
-> deux simultanément avec le même mappage, sinon `localhost:7860` renvoie
-> l'application démarrée en premier. Utiliser `-p 7861:7860` pour l'une des deux.
+> The `-p 7860:7860` maps that container port to the same port on your machine.
+> Note that this is also the API container's port. Do not run both with the same
+> mapping, or `localhost:7860` serves whichever started first — use `-p 7861:7860`
+> for one of them.
 
-## 3. Déployer sur Hugging Face Spaces
+## 3. Deploying to Hugging Face Spaces
 
-1. **Créer un Space → SDK : `Docker`.**
+1. **Create a Space → SDK: `Docker`.**
 
-   Le « SDK » indique à HF comment exécuter l'application. Le mode `Streamlit`
-   existe et suffirait pour un cas standard, mais `Docker` est retenu ici pour
-   maîtriser la version de Python et les dépendances exactement comme en local.
+   The "SDK" tells HF how to run the application. The `Streamlit` mode exists and
+   would be enough for a standard case, but `Docker` is used here to control the
+   Python version and the dependencies exactly as they are locally.
 
-2. **Pousser le *contenu* du dossier `dashboard/`** à la racine du Space — pas le
-   dossier lui-même. Ce README et son entête YAML doivent se retrouver à la
-   racine, et le fichier de données doit être présent dans `data/`.
+2. **Push the *contents* of `dashboard/`** to the root of the Space — not the
+   folder itself. This README and its YAML header must end up at the root, and the
+   dataset must be present under `data/`.
 
    ```bash
    git clone https://huggingface.co/spaces/AlexBarbier/getaround-dashboard
    cd getaround-dashboard
 
    git lfs install
-   git lfs track "*.xlsx"            # avant d'ajouter le fichier de données
+   git lfs track "*.xlsx"            # before adding the dataset
 
    cp -r ../Projet_GetAround/dashboard/. .
 
@@ -119,72 +122,99 @@ Ouvrir ensuite **http://localhost:7860**.
    git push
    ```
 
-   Sous PowerShell, la copie s'écrit :
-   `Copy-Item -Path ..\Projet_GetAround\dashboard\* -Destination . -Recurse -Force`
+   ```powershell
+   git clone https://huggingface.co/spaces/AlexBarbier/getaround-dashboard
+   cd getaround-dashboard
 
-3. **Le Space construit l'image et démarre le conteneur.** Le statut passe en
-   *Building* ; l'onglet **Logs** affiche la sortie du build puis celle de
-   Streamlit.
+   git lfs install
+   git lfs track "*.xlsx"
 
-> Les logs du Space affichent une ligne `Local URL: http://localhost:7860`. Cette
-> adresse est celle de l'intérieur du conteneur, sur les serveurs de Hugging Face
-> — elle n'est pas accessible depuis ton navigateur. L'adresse publique est celle
-> indiquée en haut de ce README.
+   # -Force on Get-ChildItem so dotfiles and .streamlit/ are included:
+   # Copy-Item with a * wildcard skips them silently.
+   Get-ChildItem ..\Projet_GetAround\dashboard -Force |
+       Copy-Item -Destination . -Recurse -Force
 
----
+   git add -A
+   git commit -m "Deploy GetAround delay analysis dashboard"
+   git push
+   ```
 
-# Lecture des données
+3. **The Space builds the image and starts the container.** The status turns
+   *Building*; the **Logs** tab shows the build output, then Streamlit's.
 
-**Le levier est réel mais étroit.** Environ 9 % des locations s'enchaînent sur la
-même voiture dans les 12 heures : c'est la seule population que la fonctionnalité
-touche. Mais à l'intérieur de ce sous-ensemble, les retours tardifs font
-nettement monter les annulations — d'environ 11 % à 17 %.
+> The Space logs print a line reading `Local URL: http://localhost:7860`. That
+> address is the inside of the container, on Hugging Face's servers — it is not
+> reachable from your browser. The public address is the one at the top of this
+> README.
 
-**Les retours diminuent vite.** Augmenter le seuil continue de résoudre des cas,
-mais chaque tranche de minutes supplémentaire en résout de moins en moins tout en
-continuant de bloquer des réservations. La zone de rendement décroissant commence
-vers deux heures.
+## Tests
 
-**Le périmètre compte plus que la largeur.** Les retards se concentrent sur les
-check-in *mobile*. Une règle limitée à *Connect* bloque donc très peu de
-réservations, mais laisse intacte la majorité des cas problématiques. Un seuil de
-**60 à 120 minutes sur toutes les voitures** couvre environ la moitié à deux tiers
-des problèmes en bloquant moins de 3 % des locations — point de départ défendable
-pour un test A/B.
+```bash
+cd dashboard
+pip install pytest
+pytest -q
+```
 
-# Limites connues
-
-**Analyse observationnelle.** Les chiffres décrivent ce qui s'est produit, pas ce
-qui se produirait après mise en place du seuil. Une réservation « bloquée » n'est
-pas nécessairement une location perdue : le conducteur peut décaler son créneau
-ou choisir une autre voiture. Le nombre de locations bloquées est donc une borne
-haute du coût réel.
-
-**Fenêtre d'enchaînement fixée à 12 heures.** Le seuil retenu pour considérer que
-deux locations se suivent est un choix de modélisation, pas une donnée. Le faire
-varier modifie la taille de la population concernée.
-
-**Valeurs extrêmes.** L'histogramme des délais est tronqué à ±5 h pour rester
-lisible, mais les simulations utilisent les valeurs brutes, y compris des retards
-de plusieurs dizaines de milliers de minutes qui relèvent probablement d'erreurs
-de saisie.
-
-**Données figées.** Le fichier Excel est embarqué dans l'image Docker. Toute mise
-à jour des données impose de reconstruire et redéployer le Space.
-
-# Évolutions possibles
-
-- **Tester la sensibilité** des conclusions à la fenêtre d'enchaînement et au
-  traitement des valeurs extrêmes.
-- **Distinguer les annulations** dues à un retard de celles ayant une autre cause,
-  pour resserrer l'estimation du bénéfice.
-- **Segmenter par ville ou par type de véhicule**, la concentration des
-  enchaînements pouvant varier fortement selon le marché local.
-- **Découpler les données de l'image** en les chargeant depuis une source externe,
-  pour actualiser l'analyse sans redéployer.
+Twenty-three tests in two files. `test_utils.py` checks the business rules against
+a hand-built six-row table, small enough that every expected number is verifiable
+by reading it — including the properties the recommendation depends on, such as
+the trade-off curve being monotonic in both directions. `test_app.py` renders the
+app in-process and moves the widgets, which catches a broken f-string or a renamed
+column before a deploy does.
 
 ---
 
-Source : `get_around_delay_analysis.xlsx`. Une location est dite *impactée* quand
-la voiture précédente est rendue après son heure de départ prévue ; un problème
-est *résolu* quand le délai imposé couvre le retard du conducteur précédent.
+# Reading of the data
+
+**The lever is real but narrow.** About 9% of rentals follow another rental of the
+same car within 12 hours: that is the only population the feature touches. But
+inside that subset, late returns clearly raise cancellations — from roughly 11% to
+17%.
+
+**Returns diminish fast.** Pushing the threshold up keeps solving cases, but each
+extra block of minutes solves fewer of them while it keeps blocking bookings. The
+diminishing-returns zone starts around two hours.
+
+**Scope matters more than width.** Lateness concentrates on *mobile* check-ins. A
+*Connect-only* rule therefore blocks very few bookings, but leaves most problem
+cases untouched. A threshold of **60 to 120 minutes on all cars** covers roughly
+half to two-thirds of the problems while blocking under 3% of rentals — a
+defensible starting point for an A/B test.
+
+# Known limitations
+
+**Observational analysis.** The figures describe what happened, not what would
+happen once a threshold is enforced. A "blocked" booking is not necessarily a lost
+rental: the driver may shift their slot or pick another car. The blocked count is
+therefore an upper bound on the real cost.
+
+**The chaining window is fixed at 12 hours.** Treating two rentals as consecutive
+within that window is a modelling choice, not a property of the data. Varying it
+changes the size of the affected population.
+
+**Extreme values.** The delay histogram is clipped to ±5h to stay readable, but the
+simulations use raw values, including delays of tens of thousands of minutes that
+are almost certainly logging errors.
+
+**Frozen data.** The Excel file is baked into the Docker image. Updating the data
+means rebuilding and redeploying the Space.
+
+# Possible extensions
+
+- **Test the sensitivity** of the conclusions to the chaining window and to the
+  handling of extreme values.
+- **Test the cancellation gap statistically** — 11% against 17% is presented as a
+  raw comparison; a two-proportion test over the ~1,700 usable pairs would say
+  whether it survives the sample size.
+- **Separate cancellations** caused by a late return from those with another cause,
+  to tighten the benefit estimate.
+- **Segment by city or vehicle type**, since the concentration of back-to-back
+  rentals may vary sharply by local market.
+- **Decouple the data from the image** by loading it from an external source, so
+  the analysis can be refreshed without a redeploy.
+
+---
+
+Source: `get_around_delay_analysis.xlsx`. A rental is *impacted* when the previous
+car is returned after its planned departure time; a problem is *solved* when the
+enforced delay covers the previous driver's lateness.

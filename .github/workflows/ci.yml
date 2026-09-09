@@ -1,0 +1,68 @@
+# Continuous integration.
+#
+# GitHub runs this file automatically on every push and every pull request. It
+# starts a clean Ubuntu machine, installs the project, and runs the checks
+# below. The result appears as a green tick or a red cross next to each commit.
+#
+# The point is not the tick itself: it is that the checks run somewhere other
+# than your laptop, on a machine with none of your local state. "It works on my
+# machine" stops being a possible answer.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Fetch the repository. lfs: true matters here — the model and the Excel
+      # file are stored with Git LFS, and without this the runner gets the
+      # pointer files instead of the real ones, which fails in a confusing way.
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r api/requirements.txt
+          pip install -r dashboard/requirements.txt
+          pip install -r model/requirements.txt
+          pip install pytest httpx ruff
+
+      # Linting first: it is the fastest check, so a formatting problem fails in
+      # seconds instead of after the whole test suite.
+      - name: Lint
+        run: ruff check .
+
+      - name: Test the delay-analysis logic
+        working-directory: dashboard
+        run: pytest -q
+
+      - name: Test the prediction API
+        working-directory: api
+        run: pytest -q
+
+      - name: Test the training script
+        working-directory: model
+        run: pytest -q
+
+  # Building the image in CI catches a broken Dockerfile before a deploy does.
+  # Split into its own job so it runs in parallel with the tests.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - run: docker build -t getaround-api ./api
+      - run: docker build -t getaround-dashboard ./dashboard

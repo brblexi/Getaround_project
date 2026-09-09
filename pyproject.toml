@@ -1,0 +1,8 @@
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+ignore = ["C408"]   # dict(...) is the idiomatic form in Plotly calls
+
+[tool.ruff.lint.isort]
+known-first-party = ["utils", "train", "app"]

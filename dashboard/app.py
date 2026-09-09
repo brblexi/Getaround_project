@@ -1,46 +1,49 @@
-"""
-=============================================================================
- GetAround — Dashboard d'analyse des délais (INTERFACE Streamlit)
-=============================================================================
-Ce fichier ne contient QUE de l'affichage. Tous les calculs sont délégués au
-module utils.py (séparation logique / interface).
+"""GetAround — delay analysis dashboard (presentation layer).
 
-Plan de l'écran, en 4 sections qui racontent une histoire :
-   1. À quelle fréquence les voitures sont-elles rendues en retard ?
-   2. Quel impact sur le conducteur suivant ?
-   3. Simulateur de seuil (interactif).
-   4. Lecture des données / recommandation.
-=============================================================================
+This module only renders: every computation lives in `utils.py`, which keeps the
+business logic importable and testable outside Streamlit.
+
+Streamlit re-runs this entire script top to bottom on every interaction — there
+is no event loop and no callback. That is why the file is plain module-level
+code, and why anything expensive goes behind @st.cache_data.
+
+Layout, in four sections:
+    1. How often are cars returned late?
+    2. What does a late return do to the next driver?
+    3. Threshold simulator.
+    4. Reading of the data and recommendation.
 """
-import numpy as np
-import pandas as pd
-import plotly.express as px        # graphiques rapides (histogramme, barres)
-import plotly.graph_objects as go  # graphiques sur mesure (courbes, barres custom)
+
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
-import utils  # notre module métier
+import utils
 
-# --------------------------------------------------------------------------- #
-# Configuration de la page + thème visuel
-# --------------------------------------------------------------------------- #
-# set_page_config DOIT être la première commande Streamlit appelée.
+# set_page_config must be the first Streamlit call.
 st.set_page_config(
     page_title="GetAround · Delay Analysis",
     page_icon="🚗",
-    layout="wide",                       # pleine largeur
-    initial_sidebar_state="expanded",    # barre latérale ouverte au démarrage
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# Palette de couleurs (identité visuelle violette de GetAround) centralisée
-# dans des constantes : on change la charte à un seul endroit.
-PRIMARY = "#6C3FFF"   # violet principal
-ACCENT = "#FF5A5F"    # rouge/corail (alertes, retards)
-INK = "#1B1340"       # texte foncé
-MUTED = "#8A85A8"     # gris pour texte secondaire
-GOOD = "#11A66A"      # vert (problèmes résolus)
+# Brand palette, centralised so the theme changes in one place.
+PRIMARY = "#6C3FFF"  # violet
+ACCENT = "#FF5A5F"   # coral: lateness, alerts
+INK = "#1B1340"      # headings and body text
+MUTED = "#8A85A8"    # secondary text
+GOOD = "#11A66A"     # solved problems
 
-# Un peu de CSS injecté pour soigner la typographie et les "pilules"/encadrés.
-# unsafe_allow_html=True est nécessaire pour que Streamlit interprète le HTML.
+# Display-only bound for the delay histogram: raw values reach ±70,000 minutes,
+# which would flatten the entire distribution. Simulations use raw values.
+DELAY_CLIP_MINUTES = 300
+
+
+# Streamlit exposes no API for content width or custom components, so the pill
+# and the recommendation box need raw CSS. Nothing here comes from user input,
+# so the "unsafe" flag carries no injection risk; the fragile part is depending
+# on .block-container, an internal class Streamlit could rename.
 st.markdown(
     f"""
     <style>
@@ -59,27 +62,37 @@ st.markdown(
 )
 
 
-# --------------------------------------------------------------------------- #
-# Chargement des données (mis en cache)
-# --------------------------------------------------------------------------- #
-# @st.cache_data : Streamlit ré-exécute TOUT le script à chaque interaction
-# (ex. déplacement du slider). Le cache garantit que le chargement Excel et les
-# calculs lourds ne se font QU'UNE SEULE FOIS, pas à chaque coup de slider.
 @st.cache_data
 def get_data():
-    df = utils.load_rentals()                 # table brute
-    chain = utils.build_chained_pairs(df)     # paires enchaînées (self-join)
-    metrics = utils.headline_metrics(df, chain)
-    return df, chain, metrics
+    """Load the dataset and derive the aggregates used across the page.
+
+    Streamlit re-runs the whole script on every interaction; caching keeps the
+    Excel read and the self-join out of the slider's critical path.
+    """
+    rentals = utils.load_rentals()
+    chained = utils.build_chained_pairs(rentals)
+    return rentals, chained, utils.headline_metrics(rentals, chained)
 
 
-df, chain, M = get_data()
-TOTAL = M["total_rentals"]
+df, chain, metrics = get_data()
+TOTAL_RENTALS = metrics["total_rentals"]
 
 
-# --------------------------------------------------------------------------- #
-# En-tête : titre + contexte + ligne de KPI
-# --------------------------------------------------------------------------- #
+@st.cache_data
+def get_curve(_chain, scope, total_rentals):
+    """Cache the trade-off curve, which depends only on the scope.
+
+    The curve is 49 simulations over the whole threshold range; without this it
+    would be recomputed on every slider move to redraw an identical line.
+    The leading underscore tells Streamlit not to hash the DataFrame — it
+    cannot — while still keying the cache on scope.
+    """
+    return utils.tradeoff_curve(_chain, scope, total_rentals)
+
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
 st.markdown('<span class="pill">Product analytics</span>', unsafe_allow_html=True)
 st.title("GetAround — Should we enforce a delay between rentals?")
 st.markdown(
@@ -91,108 +104,133 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# st.columns(5) crée 5 colonnes côte à côte pour aligner 5 indicateurs.
 k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Total rentals", f"{M['total_rentals']:,}")
-k2.metric("Returned late", f"{M['late_rate']*100:.0f}%", help="Share of ended rentals checked out after the planned time")
-k3.metric("Median lateness", f"{M['median_late']:.0f} min", help="Among late returns only")
-k4.metric("Back-to-back rentals", f"{M['chained_share']*100:.1f}%", help="Have a previous rental of the same car within 12h — the population the feature touches")
+k1.metric("Total rentals", f"{metrics['total_rentals']:,}")
+k2.metric(
+    "Returned late",
+    f"{metrics['late_rate'] * 100:.0f}%",
+    help="Share of ended rentals checked out after the planned time",
+)
+k3.metric(
+    "Median lateness",
+    f"{metrics['median_late']:.0f} min",
+    help="Among late returns only",
+)
+k4.metric(
+    "Back-to-back rentals",
+    f"{metrics['chained_share'] * 100:.1f}%",
+    help="Rentals preceded by another rental of the same car within 12h — the population the feature touches",
+)
 k5.metric(
     "Late return → impact",
-    f"{M['impacted_rate']*100:.1f}%",
+    f"{metrics['impacted_rate'] * 100:.1f}%",
     help="Share of back-to-back rentals where the previous car came back after the planned start",
 )
 
 st.divider()
 
-# --------------------------------------------------------------------------- #
-# SECTION 1 — Fréquence et gravité des retards
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# 1 — Frequency and severity of late returns
+# ---------------------------------------------------------------------------
 st.header("1 · How often are cars returned late?")
-c1, c2 = st.columns([3, 2])   # ratio de largeur 3:2 entre les deux graphiques
+left, right = st.columns([3, 2])
 
-with c1:
-    ended = df[df["state"] == "ended"].copy()
-    d = ended["delay_at_checkout_in_minutes"].dropna()
-    # IMPORTANT : on "clippe" à ±300 min UNIQUEMENT pour l'AFFICHAGE
-    # (sinon les outliers extrêmes ±70 000 min écrasent l'histogramme).
-    # La logique métier de simulation, elle, garde les valeurs brutes.
-    d_clip = d.clip(-300, 300)
-    fig = px.histogram(d_clip, nbins=60, color_discrete_sequence=[PRIMARY])
-    fig.add_vline(x=0, line_dash="dash", line_color=INK)  # repère "à l'heure"
-    fig.update_layout(
-        title="Checkout delay distribution (clipped to ±5h)",
-        xaxis_title="Delay at checkout (minutes)  ·  negative = returned early",
-        yaxis_title="Rentals", showlegend=False, bargap=0.02,
-        plot_bgcolor="white", height=360, margin=dict(t=50, b=10),
+with left:
+    delays = utils.checkout_delays(df)
+    # clip() bends the picture, not the data: outliers pile onto the bounds so
+    # the bulk of the distribution stays readable. utils returns raw values and
+    # simulate() never sees a clipped number.
+    fig = px.histogram(
+        delays.clip(-DELAY_CLIP_MINUTES, DELAY_CLIP_MINUTES),
+        nbins=60,
+        color_discrete_sequence=[PRIMARY],
     )
-    st.plotly_chart(fig, width='stretch')
+    fig.add_vline(x=0, line_dash="dash", line_color=INK)  # on-time reference
+    fig.update_layout(
+        title=f"Checkout delay distribution (clipped to ±{DELAY_CLIP_MINUTES // 60}h)",
+        xaxis_title="Delay at checkout (minutes)  ·  negative = returned early",
+        yaxis_title="Rentals",
+        showlegend=False,
+        bargap=0.02,
+        plot_bgcolor="white",
+        height=360,
+        margin=dict(t=50, b=10),
+    )
+    st.plotly_chart(fig, width="stretch")
 
-with c2:
-    # Parmi les retards positifs, on range en tranches de gravité.
-    late = ended.loc[ended["delay_at_checkout_in_minutes"] > 0, "delay_at_checkout_in_minutes"]
-    buckets = pd.cut(
-        late, [0, 15, 30, 60, 120, np.inf],
-        labels=["0–15 min", "15–30 min", "30–60 min", "1–2 h", "2 h +"],
-    ).value_counts().sort_index()
+with right:
+    buckets = utils.lateness_buckets(df)
     fig2 = px.bar(
-        x=buckets.values, y=buckets.index, orientation="h",
+        x=buckets.values,
+        y=buckets.index,
+        orientation="h",
         color_discrete_sequence=[ACCENT],
     )
     fig2.update_layout(
         title="How late, when late",
-        xaxis_title="Rentals", yaxis_title="",
-        plot_bgcolor="white", height=360, margin=dict(t=50, b=10),
+        xaxis_title="Rentals",
+        yaxis_title="",
+        plot_bgcolor="white",
+        height=360,
+        margin=dict(t=50, b=10),
     )
-    st.plotly_chart(fig2, width='stretch')
+    st.plotly_chart(fig2, width="stretch")
 
+severe_share = buckets["2 h +"] / buckets.sum()
 st.markdown(
-    f'<p class="lead"><b>{M["late_rate"]*100:.0f}% of returns are late</b>, with a '
-    f"median lateness of {M['median_late']:.0f} min — but over a quarter of late "
-    "returns exceed 2 hours, which is what hurts the next driver.</p>",
+    f'<p class="lead"><b>{metrics["late_rate"] * 100:.0f}% of returns are late</b>, with a '
+    f"median lateness of {metrics['median_late']:.0f} min — but "
+    f"{severe_share * 100:.0f}% of late returns exceed two hours, which is what "
+    "hurts the next driver.</p>",
     unsafe_allow_html=True,
 )
 
 st.divider()
 
-# --------------------------------------------------------------------------- #
-# SECTION 2 — Impact sur le conducteur suivant
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# 2 — Impact on the next driver
+# ---------------------------------------------------------------------------
 st.header("2 · What does it do to the next driver?")
-c3, c4 = st.columns(2)
+left, right = st.columns(2)
 
-with c3:
-    # Taux d'impact ventilé par type de check-in (mobile vs connect).
-    known = chain.dropna(subset=["previous_delay_at_checkout"])
-    by_type = known.groupby("checkin_type")["impacted"].mean().mul(100)
+with left:
+    by_type = utils.impact_rate_by_checkin(chain)
     fig3 = px.bar(
-        x=by_type.index, y=by_type.values,
+        x=by_type.index,
+        y=by_type.values * 100,
         color=by_type.index,
         color_discrete_map={"mobile": ACCENT, "connect": PRIMARY},
     )
     fig3.update_layout(
         title="Share of back-to-back rentals impacted, by check-in type",
-        xaxis_title="", yaxis_title="% impacted", showlegend=False,
-        plot_bgcolor="white", height=340, margin=dict(t=50, b=10),
+        xaxis_title="",
+        yaxis_title="% impacted",
+        showlegend=False,
+        plot_bgcolor="white",
+        height=340,
+        margin=dict(t=50, b=10),
     )
-    st.plotly_chart(fig3, width='stretch')
+    st.plotly_chart(fig3, width="stretch")
 
-with c4:
-    # Comparaison du taux d'annulation : non-impactées vs impactées.
-    # cancel_lift = (taux si impactée, taux sinon) calculé dans utils.
-    imp, clean = M["cancel_lift"]
-    fig4 = go.Figure(go.Bar(
-        x=["Not impacted", "Impacted by late return"],
-        y=[clean * 100, imp * 100],
-        marker_color=[MUTED, ACCENT],
-        text=[f"{clean*100:.0f}%", f"{imp*100:.0f}%"], textposition="outside",
-    ))
+with right:
+    impacted_rate, clean_rate = metrics["cancel_lift"]
+    fig4 = go.Figure(
+        go.Bar(
+            x=["Not impacted", "Impacted by late return"],
+            y=[clean_rate * 100, impacted_rate * 100],
+            marker_color=[MUTED, ACCENT],
+            text=[f"{clean_rate * 100:.0f}%", f"{impacted_rate * 100:.0f}%"],
+            textposition="outside",
+        )
+    )
     fig4.update_layout(
         title="Cancellation rate rises when the previous car is late",
-        yaxis_title="Cancellation rate", plot_bgcolor="white",
-        height=340, margin=dict(t=50, b=10),
+        yaxis_title="Cancellation rate",
+        plot_bgcolor="white",
+        height=340,
+        margin=dict(t=50, b=10),
     )
-    st.plotly_chart(fig4, width='stretch')
+    st.plotly_chart(fig4, width="stretch")
 
 st.markdown(
     '<p class="lead">Late returns hit <b>mobile</b> check-ins almost twice as '
@@ -203,18 +241,16 @@ st.markdown(
 
 st.divider()
 
-# --------------------------------------------------------------------------- #
-# SECTION 3 — Simulateur de seuil (interactif)
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# 3 — Threshold simulator
+# ---------------------------------------------------------------------------
 st.header("3 · Simulate a threshold")
 
-# Les contrôles sont placés dans la barre latérale (st.sidebar).
-# À chaque changement, Streamlit relance le script -> les KPI/graphes se
-# recalculent (mais les données restent en cache, donc c'est instantané).
 with st.sidebar:
     st.markdown("### ⚙️ Simulation")
     scope = st.radio(
-        "Scope", ["all", "connect"],
+        "Scope",
+        ["all", "connect"],
         format_func=lambda s: "All cars" if s == "all" else "Connect only",
     )
     threshold = st.slider("Minimum delay between rentals (minutes)", 0, 720, 120, 15)
@@ -224,49 +260,64 @@ with st.sidebar:
         "now covers the previous driver's lateness."
     )
 
-# Un seul appel pour obtenir tous les chiffres de la configuration choisie.
-sim = utils.simulate(chain, threshold, scope, TOTAL)
+sim = utils.simulate(chain, threshold, scope, TOTAL_RENTALS)
 
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Rentals blocked", f"{sim['blocked']:,}", help="Bookings prevented because the gap is shorter than the threshold")
-m2.metric("…as % of all rentals", f"{sim['blocked_share_total']*100:.2f}%")
+m1.metric(
+    "Rentals blocked",
+    f"{sim['blocked']:,}",
+    help="Bookings prevented because the gap is shorter than the threshold",
+)
+m2.metric("…as % of all rentals", f"{sim['blocked_share_total'] * 100:.2f}%")
 m3.metric("Problem cases solved", f"{sim['solved']} / {sim['impacted']}")
-m4.metric("…% of problems solved", f"{sim['solved_share']*100:.0f}%")
+m4.metric("…% of problems solved", f"{sim['solved_share'] * 100:.0f}%")
 
-# Courbe d'arbitrage : on superpose les deux séries (résolus vs bloquées)
-# sur tout le balayage de seuils, et on marque le seuil courant en pointillé.
-curve = utils.tradeoff_curve(chain, scope, TOTAL)
+# Trade-off curve: both series swept over the full threshold range, with the
+# current slider position marked.
+curve = get_curve(chain, scope, TOTAL_RENTALS)
 fig5 = go.Figure()
-fig5.add_trace(go.Scatter(
-    x=curve["threshold"], y=curve["pct_problems_solved"],
-    name="% problems solved", line=dict(color=GOOD, width=3)))
-fig5.add_trace(go.Scatter(
-    x=curve["threshold"], y=curve["pct_rentals_blocked"],
-    name="% of all rentals blocked", line=dict(color=ACCENT, width=3)))
-fig5.add_vline(x=threshold, line_dash="dash", line_color=INK)  # position du curseur
+fig5.add_trace(
+    go.Scatter(
+        x=curve["threshold"],
+        y=curve["pct_problems_solved"],
+        name="% problems solved",
+        line=dict(color=GOOD, width=3),
+    )
+)
+fig5.add_trace(
+    go.Scatter(
+        x=curve["threshold"],
+        y=curve["pct_rentals_blocked"],
+        name="% of all rentals blocked",
+        line=dict(color=ACCENT, width=3),
+    )
+)
+fig5.add_vline(x=threshold, line_dash="dash", line_color=INK)
 fig5.update_layout(
-    title=f"Trade-off curve — scope: {'all cars' if scope=='all' else 'Connect only'}",
-    xaxis_title="Threshold (minutes)", yaxis_title="Percent",
-    plot_bgcolor="white", height=420, margin=dict(t=50, b=10),
+    title=f"Trade-off curve — scope: {'all cars' if scope == 'all' else 'Connect only'}",
+    xaxis_title="Threshold (minutes)",
+    yaxis_title="Percent",
+    plot_bgcolor="white",
+    height=420,
+    margin=dict(t=50, b=10),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
 )
-st.plotly_chart(fig5, width='stretch')
+st.plotly_chart(fig5, width="stretch")
 
-# Phrase de synthèse dynamique : se met à jour avec le seuil/périmètre choisi.
 st.markdown(
     f'<p class="lead">At <b>{threshold} min</b> on <b>'
-    f'{"all cars" if scope=="all" else "Connect only"}</b>, you solve '
-    f'<b>{sim["solved_share"]*100:.0f}%</b> of problematic hand-overs while '
-    f'blocking <b>{sim["blocked_share_total"]*100:.2f}%</b> of all rentals '
+    f'{"all cars" if scope == "all" else "Connect only"}</b>, you solve '
+    f'<b>{sim["solved_share"] * 100:.0f}%</b> of problematic hand-overs while '
+    f'blocking <b>{sim["blocked_share_total"] * 100:.2f}%</b> of all rentals '
     f'({sim["blocked"]:,} bookings).</p>',
     unsafe_allow_html=True,
 )
 
 st.divider()
 
-# --------------------------------------------------------------------------- #
-# SECTION 4 — Lecture des données / recommandation
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# 4 — Reading of the data
+# ---------------------------------------------------------------------------
 st.header("4 · Reading of the data")
 st.markdown(
     """
