@@ -1,5 +1,7 @@
 # GetAround — delay analysis and price prediction
 
+![CI](https://github.com/brblexi/Getaround_project/actions/workflows/ci.yml/badge.svg)
+
 End-to-end machine learning project on car-sharing data: an interactive dashboard
 that quantifies a product decision, a pricing model tracked with MLflow, and a
 containerised API that serves it. Both applications are deployed and live.
